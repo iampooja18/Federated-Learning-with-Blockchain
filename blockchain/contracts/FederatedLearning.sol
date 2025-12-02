@@ -19,6 +19,10 @@ contract FederatedLearning {
     }
 
     address public owner;
+
+    // 🔥 NEW — stores latest active round number
+    uint256 public currentRound;
+
     mapping(uint256 => RoundInfo) public rounds;
 
     event RoundStarted(uint256 roundId, string uri);
@@ -27,12 +31,13 @@ contract FederatedLearning {
     event AggregatedStored(uint256 roundId, string uri);
 
     modifier onlyOwner() {
-        require(msg.sender == owner);
+        require(msg.sender == owner, "Not owner");
         _;
     }
 
     constructor() {
         owner = msg.sender;
+        currentRound = 0;
     }
 
     function startRound(uint256 roundId, string memory uri, string memory hash)
@@ -44,6 +49,9 @@ contract FederatedLearning {
         r.globalModelUri = uri;
         r.globalModelHash = hash;
         r.collecting = true;
+
+        // 🔥 Set active round
+        currentRound = roundId;
 
         emit RoundStarted(roundId, uri);
     }
@@ -77,6 +85,8 @@ contract FederatedLearning {
         rounds[roundId].globalModelHash = hash;
         rounds[roundId].aggregatedStored = true;
 
+        // (optional) next round will be started by orchestrator
+        
         emit AggregatedStored(roundId, uri);
     }
 

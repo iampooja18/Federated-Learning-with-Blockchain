@@ -2,8 +2,8 @@
   "_format": "hh-sol-cache-2",
   "files": {
     "D:\\B- Tech\\VNIT\\federated learning\\blockchain-fl\\blockchain\\contracts\\FederatedLearning.sol": {
-      "lastModificationDate": 1764687235632,
-      "contentHash": "b84bbb49b3352aab805232c4e0fe7690",
+      "lastModificationDate": 1764689409007,
+      "contentHash": "b6c8659257e2e6b3bf8a383e19799156",
       "sourceName": "contracts/FederatedLearning.sol",
       "solcConfig": {
         "version": "0.8.20",

@@ -4,38 +4,44 @@ const fs = require("fs");
 const path = require("path");
 const cors = require("cors");
 const bodyParser = require("body-parser");
+const axios = require("axios");
+const multer = require("multer");
 const { Web3 } = require("web3");
 
 const app = express();
 app.use(cors({ origin: "*" }));
 app.use(bodyParser.json({ limit: "50mb" }));
 
-// NOTE: this file is inside fl/, so require ./config
+// Load config
 const { RPC_URL, CONTRACT_ADDRESS, ABI, CLIENT_PRIVATE_KEY, OWNER_PRIVATE_KEY } = require("./config");
 
-// Setup web3 & contract
+// Setup web3
 const web3 = new Web3(RPC_URL);
 
-// Add keys to wallet (if already added, web3 will ignore duplicates)
+// Load private keys
 try {
   if (CLIENT_PRIVATE_KEY) web3.eth.accounts.wallet.add(CLIENT_PRIVATE_KEY);
   if (OWNER_PRIVATE_KEY) web3.eth.accounts.wallet.add(OWNER_PRIVATE_KEY);
-} catch (e) {
-  // ignore if already present
-}
+} catch (e) {}
 
-const walletAccounts = web3.eth.accounts.wallet;
-if (walletAccounts.length === 0) {
-  console.warn("[NODE] No accounts in wallet. Make sure CLIENT_PRIVATE_KEY or OWNER_PRIVATE_KEY is set in fl/config.js");
-}
-
+const wallet = web3.eth.accounts.wallet;
 const contract = new web3.eth.Contract(ABI, CONTRACT_ADDRESS);
-const ROUND = 1; // static default; change if you pass round in request
 
-// ------------------------
-// 1) Predict proxy (Frontend → Node → Python)
-// ------------------------
-const multer = require("multer");
+// ================================================================
+//   🔥 GET CURRENT ROUND
+// ================================================================
+app.get("/current-round", async (req, res) => {
+  try {
+    const round = await contract.methods.currentRound().call();
+    res.json({ round: Number(round) });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.toString() });
+  }
+});
+
+// ================================================================
+//   🔥 PREDICT (Image → Python Server)
+// ================================================================
 const upload = multer({ dest: path.join(__dirname, "../storage/uploads/") });
 
 app.post("/predict", upload.single("image"), async (req, res) => {
@@ -43,79 +49,97 @@ app.post("/predict", upload.single("image"), async (req, res) => {
     if (!req.file)
       return res.status(400).json({ success: false, message: "Image required" });
 
-    // Read image bytes
-    const imageBytes = fs.readFileSync(req.file.path);
+    const imgBytes = fs.readFileSync(req.file.path);
 
-    // Send to Python server as raw bytes
-    const axios = require("axios");
-    const pyRes = await axios.post("http://127.0.0.1:6000/predict", imageBytes, {
+    const pyRes = await axios.post("http://127.0.0.1:6000/predict", imgBytes, {
       headers: { "Content-Type": "application/octet-stream" }
     });
 
-    return res.json(pyRes.data);
+    res.json(pyRes.data);
 
   } catch (err) {
     console.error("PYTHON ERROR:", err.response?.data || err);
-    res.status(500).json({ success: false, message: "Prediction failed", error: err.toString() });
+    res.status(500).json({ success: false, error: err.toString() });
   }
 });
 
-// ------------------------
-// 2) Submit FL update (Python client → Node → Blockchain)
-// ------------------------
+// ================================================================
+//   🔥 SUBMIT UPDATE TO BLOCKCHAIN
+// ================================================================
 app.post("/submit-update", async (req, res) => {
   try {
     const { weightsPath, weightsHash, weightsSize, round } = req.body;
 
     if (!weightsPath || !weightsHash)
-      return res.status(400).json({ success: false, message: "Invalid update" });
+      return res.status(400).json({ success: false, message: "Invalid update metadata" });
 
-    const usingRound = round !== undefined ? round : ROUND;
+    // 1️⃣ Fetch current round from blockchain
+    const currentRound = await contract.methods.currentRound().call();
+    const usingRound = round ?? currentRound;
 
-    console.log("\nReceived FL update:");
-    console.log("Path:", weightsPath);
-    console.log("Hash:", weightsHash);
-    console.log("Size:", weightsSize);
-    console.log("Round:", usingRound);
+    console.log("\n📥 New FL Update Received");
+    console.log("  Path:", weightsPath);
+    console.log("  Hash:", weightsHash);
+    console.log("  Size:", weightsSize);
+    console.log("  Round:", usingRound);
 
-    // Use first wallet account as sender (prefer client key if present)
-    if (!web3.eth.accounts.wallet.length) {
-      return res.status(500).json({ success: false, message: "No wallet accounts available to send transaction" });
+    const from = wallet[0].address;
+
+    // Convert to BigInt for Web3 v4
+    const roundBig = BigInt(usingRound);
+    const sizeBig = BigInt(weightsSize);
+
+    // ================================================================
+    //   ✔ OPTION 1 FIX → CHECK IF ROUND IS STILL COLLECTING
+    // ================================================================
+    const roundInfo = await contract.methods.rounds(roundBig).call();
+
+    if (!roundInfo.collecting) {
+      console.log("⚠ Update rejected: Round already closed:", usingRound);
+      return res.status(400).json({
+        success: false,
+        message: "Round is already closed — update ignored"
+      });
     }
-    const from = web3.eth.accounts.wallet[0].address;
 
-    // Convert numeric inputs to strings to avoid BigInt mixing errors with web3 v4
-    const roundStr = String(usingRound);
-    const sizeStr = String(weightsSize);
-
-    // Safely estimate gas, fallback to a default
+    // ================================================================
+    // 2️⃣ Estimate gas
+    // ================================================================
     let gas;
     try {
       gas = await contract.methods
-        .submitUpdate(roundStr, weightsPath, weightsHash, sizeStr)
+        .submitUpdate(roundBig, weightsPath, weightsHash, sizeBig)
         .estimateGas({ from });
-      // add modest cushion
+
       gas = Math.floor(gas * 1.25);
     } catch (err) {
-      console.warn("[NODE] estimateGas failed, using fallback gas:", err.toString());
-      gas = 500_000; // fallback gas limit
+      console.warn("⚠ Gas estimation error:", err.toString());
+      gas = 500_000;
     }
 
-    // Send tx
+    // ================================================================
+    // 3️⃣ Submit to blockchain
+    // ================================================================
     const tx = await contract.methods
-      .submitUpdate(roundStr, weightsPath, weightsHash, sizeStr)
+      .submitUpdate(roundBig, weightsPath, weightsHash, sizeBig)
       .send({ from, gas });
 
-    console.log("[NODE] Update submitted on-chain:", tx.transactionHash);
+    console.log("✅ Update submitted on-chain:", tx.transactionHash);
 
-    return res.json({ success: true, message: "Update saved", txHash: tx.transactionHash });
+    res.json({
+      success: true,
+      txHash: tx.transactionHash
+    });
 
   } catch (err) {
-    console.error("Error submitting update to blockchain:", err);
-    res.status(500).json({ success: false, message: "Failed to submit update", error: err.toString() });
+    console.error("❌ Error submitting update:", err);
+    res.status(500).json({ success: false, error: err.toString() });
   }
 });
 
+// ================================================================
+//   START SERVER
+// ================================================================
 app.listen(5000, () =>
-  console.log("Node API running at http://127.0.0.1:5000")
+  console.log("🚀 Node API running at http://127.0.0.1:5000")
 );
