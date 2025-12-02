@@ -21,10 +21,8 @@ module.exports = {
   ABI,
 
   // Path to global weights file (JSON version)
-  GLOBAL_MODEL_PATH: path.join(
-    __dirname,
-    "../storage/global_model/weights.json"
-  ),
+  GLOBAL_MODEL_PATH: path.join(__dirname, "../storage/global_fed_model.h5"),
+
 
   STORAGE_MODELS: path.join(__dirname, "../storage/models"),
   STORAGE_UPDATES: path.join(__dirname, "../storage/updates"),
