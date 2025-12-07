@@ -59,6 +59,8 @@ def predict():
         weights_path = os.path.join(UPDATE_DIR, f"weights_{h[:12]}.json")
         json.dump({"weights": flat}, open(weights_path, "w"))
 
+        
+
         return jsonify({
             "success": True,
             "label": label,

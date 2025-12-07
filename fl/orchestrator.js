@@ -7,7 +7,7 @@ const { Web3 } = require("web3");
 const {
     RPC_URL, CONTRACT_ADDRESS, ABI,
     OWNER_PRIVATE_KEY, STORAGE_MODELS,
-    GLOBAL_MODEL_PATH
+    GLOBAL_MODEL_PATH, STORAGE_UPDATES
 } = require("./config");
 
 const { hashFile } = require("./utils");
@@ -15,20 +15,35 @@ const { hashFile } = require("./utils");
 const web3 = new Web3(RPC_URL);
 const owner = web3.eth.accounts.privateKeyToAccount(OWNER_PRIVATE_KEY);
 web3.eth.accounts.wallet.add(owner);
+
 const contract = new web3.eth.Contract(ABI, CONTRACT_ADDRESS);
 
 let ROUND = 1;
 
+// ---------------------------------------------------------------------------
+// Ensure global_model folder exists
+// ---------------------------------------------------------------------------
+const GLOBAL_FOLDER = path.join(__dirname, "../storage/global_model");
+fs.mkdirSync(GLOBAL_FOLDER, { recursive: true });
+
+// ---------------------------------------------------------------------------
+// Resolve blockchain model URI → absolute path
+// ---------------------------------------------------------------------------
+function resolveUpdatePath(uri) {
+    if (path.isAbsolute(uri)) return uri;
+    return path.join(STORAGE_UPDATES, uri);
+}
+
+// ---------------------------------------------------------------------------
+// Start Round
+// ---------------------------------------------------------------------------
 async function startRound() {
     console.log(`\n🚀 Starting Round ${ROUND} ...`);
 
     const hash = hashFile(GLOBAL_MODEL_PATH);
 
-    // string conversion for web3 v4 compatibility
-    const roundStr = String(ROUND);
-
     await contract.methods.startRound(
-        roundStr,
+        String(ROUND),
         GLOBAL_MODEL_PATH,
         hash
     ).send({ from: owner.address });
@@ -36,8 +51,10 @@ async function startRound() {
     console.log(`[ORCH] Round ${ROUND} started`);
 }
 
+// ---------------------------------------------------------------------------
+// Aggregate Round
+// ---------------------------------------------------------------------------
 async function aggregateRound() {
-    // getUpdateCount expects a compatible type - pass string
     const count = await contract.methods.getUpdateCount(String(ROUND)).call();
 
     if (Number(count) === 0) {
@@ -47,73 +64,122 @@ async function aggregateRound() {
 
     console.log(`[ORCH] Aggregating ${count} updates...`);
 
-    // Collect update URIs and sizes
-    let uris = [];
+    let updatePaths = [];
     let sizes = [];
+
+    // ---------------------------------------------------------
+    // FETCH updates & skip missing files (IMPORTANT FIX)
+    // ---------------------------------------------------------
     for (let i = 0; i < Number(count); i++) {
-        // getUpdate(round, index) - pass round as string
-        const res = await contract.methods.getUpdate(String(ROUND), i).call();
-        // getUpdate returns tuple: (address, string uri, string hash, uint256 dataSize)
-        // Ensure we access fields correctly:
-        // res[0] = client, res[1] = uri, res[2] = hash, res[3] = size
-        const uri = res[1];
-        const size = res[3];
-        uris.push(uri);
+        const u = await contract.methods.getUpdate(String(ROUND), i).call();
+        const uri = u[1];
+        const size = u[3];
+
+        const localPath = resolveUpdatePath(uri);
+
+        if (!fs.existsSync(localPath)) {
+            console.log(`⚠️ Skipping missing update: ${localPath}`);
+            continue;  // ← FIX: Skip instead of stopping
+        }
+
+        updatePaths.push(localPath);
         sizes.push(size);
     }
 
-    // Create output folder for aggregated model
-    const outFolder = path.join(STORAGE_MODELS, `round_${ROUND}_agg`);
-    fs.mkdirSync(outFolder, { recursive: true });
-    const outPath = path.join(outFolder, "model_agg.h5");
-
-    // Build Python aggregator args
-    // Use process.env.PYTHON to prefer 'python' or 'python3' depending on env
-    const pythonBin = process.env.PYTHON || "python";
-    const aggScript = path.resolve(__dirname, "aggregate_h5.py");
-
-    // args: <out_path> <global_model_path> <update1_path> <size1> ...
-    const args = [aggScript, outPath, GLOBAL_MODEL_PATH];
-    for (let i = 0; i < uris.length; i++) {
-        args.push(uris[i]);
-        args.push(String(sizes[i]));
-    }
-
-    console.log("[ORCH] Running Python aggregator:", pythonBin, args.join(" "));
-    const py = spawnSync(pythonBin, args, { stdio: "inherit" });
-
-    if (py.status !== 0) {
-        console.error("[ORCH] Python aggregator failed (exit code)", py.status);
+    if (updatePaths.length === 0) {
+        console.log(`[ORCH] No valid updates available. Skipping aggregation.`);
         return;
     }
 
-    // After aggregator completes, compute hash of aggregated .h5
-    const newHash = hashFile(outPath);
+    // ---------------------------------------------------------
+    // Create aggregation output folder
+    // ---------------------------------------------------------
+    const outFolder = path.join(STORAGE_MODELS, `round_${ROUND}_agg`);
+    fs.mkdirSync(outFolder, { recursive: true });
 
-    // convert numeric params to strings for web3 v4
-    const roundStr = String(ROUND);
+    const outPath = path.join(outFolder, "model_agg.h5");
 
-    await contract.methods.closeRound(roundStr).send({ from: owner.address });
+    // ---------------------------------------------------------
+    // Run Python Aggregator
+    // ---------------------------------------------------------
+    const python = process.env.PYTHON || "python";
+    const aggScript = path.resolve(__dirname, "aggregate_h5.py");
 
-    // storeAggregated takes (roundId, uri, hash)
-    // For uri we store outFolder so clients can find model_agg.h5 inside it
-    await contract.methods.storeAggregated(roundStr, outFolder, newHash).send({ from: owner.address });
+    const args = [aggScript, outPath, GLOBAL_MODEL_PATH];
 
-    console.log(`[ORCH] Round ${ROUND} aggregation complete. Stored at: ${outPath}`);
+    updatePaths.forEach((p, i) => {
+        args.push(p);
+        args.push(String(sizes[i]));
+    });
 
-    // overwrite global model for next round
-    fs.copyFileSync(outPath, GLOBAL_MODEL_PATH);
+    console.log("[ORCH] Running Python aggregator:\n", python, args.join(" "));
+    const py = spawnSync(python, args, { stdio: "inherit" });
+
+    if (py.status !== 0) {
+        console.error("❌ Aggregator FAILED (exit:", py.status, ")");
+        return;
+    }
+
+    const aggHash = hashFile(outPath);
+
+    await contract.methods.closeRound(String(ROUND)).send({ from: owner.address });
+    await contract.methods.storeAggregated(
+        String(ROUND),
+        outFolder,
+        aggHash
+    ).send({ from: owner.address });
+
+    console.log(`[ORCH] Round ${ROUND} aggregation complete`);
+    console.log(`[ORCH] Aggregated model saved at: ${outPath}`);
+
+    // ======================================================================
+    // SAFE UPDATE OF GLOBAL MODEL (Windows + TensorFlow FIX)
+    // ======================================================================
+    try {
+        // 1. Delete existing global model to avoid Windows lock error
+        if (fs.existsSync(GLOBAL_MODEL_PATH)) {
+            try {
+                fs.unlinkSync(GLOBAL_MODEL_PATH);
+            } catch (err) {
+                console.log("[ORCH] Waiting for TF to release global model...");
+                await new Promise(r => setTimeout(r, 2000));
+                fs.unlinkSync(GLOBAL_MODEL_PATH);
+            }
+        }
+
+        // 2. Wait a moment so Python releases file handles
+        await new Promise(r => setTimeout(r, 1000));
+
+        // 3. Copy new model safely
+        fs.copyFileSync(outPath, GLOBAL_MODEL_PATH);
+        console.log("[ORCH] Global model updated successfully!");
+
+    } catch (err) {
+        console.error("❌ Failed to update GLOBAL MODEL:", err);
+        return;
+    }
+
+    // ----------------------------------------------------------------------
+    // Save historical snapshot
+    // ----------------------------------------------------------------------
+    const roundCopy = path.join(GLOBAL_FOLDER, `round_${ROUND}_model.h5`);
+    fs.copyFileSync(outPath, roundCopy);
+
+    console.log(`[ORCH] Saved round snapshot: ${roundCopy}`);
 
     ROUND++;
 }
 
+// ---------------------------------------------------------------------------
+// Main Loop
+// ---------------------------------------------------------------------------
 async function loop() {
     await startRound();
 
     setTimeout(async () => {
         await aggregateRound();
         setTimeout(loop, 5000);
-    }, 15000);
+    }, 12000);
 }
 
 loop();

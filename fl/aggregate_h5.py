@@ -1,36 +1,39 @@
 # fl/aggregate_h5.py
 # Usage:
-# python3 aggregate_h5.py <out_path> <global_model_path> <update1_path> <size1> <update2_path> <size2> ...
+# python3 aggregate_h5.py <out_path> <global_model_path> <update1_json> <size1> <update2_json> <size2> ...
+
 import sys
 import os
+import json
 import numpy as np
 import tensorflow as tf
-from tensorflow.keras.models import load_model, save_model
+import keras
 
-def load_weights_list(h5_path):
-    m = load_model(h5_path)
-    return [w.copy() for w in m.get_weights()]
 
-def deep_copy_weights(weights):
-    return [np.array(w) for w in weights]
+def load_json_weights(path):
+    with open(path, "r", encoding="utf-8") as f:  # <-- add encoding="utf-8" here
+        data = json.load(f)
+    return data
+
 
 def weighted_average(weight_sets, sizes):
     total = sum(sizes)
-    # Convert sizes to float weights
     factors = [s / total for s in sizes]
-    # assume all weight_sets have same length and shapes
-    avg = []
+
+    averaged = []
     for layer_idx in range(len(weight_sets[0])):
-        # start with zeros of correct shape
-        accum = np.zeros_like(weight_sets[0][layer_idx], dtype=np.float64)
-        for ws, f in zip(weight_sets, factors):
-            accum += ws[layer_idx].astype(np.float64) * f
-        avg.append(accum.astype(np.float32))
-    return avg
+        layer_sum = np.zeros_like(weight_sets[0][layer_idx], dtype=np.float64)
+
+        for w, f in zip(weight_sets, factors):
+            layer_sum += w[layer_idx].astype(np.float64) * f
+
+        averaged.append(layer_sum.astype(np.float32))
+
+    return averaged
 
 def main():
     if len(sys.argv) < 5 or (len(sys.argv) - 3) % 2 != 0:
-        print("Usage: python3 aggregate_h5.py <out_path> <global_model_path> <update1_path> <size1> [<update2_path> <size2> ...]")
+        print("Usage: python3 aggregate_h5.py <out_path> <global_model_path> <update1_json> <size1> ...")
         sys.exit(2)
 
     out_path = sys.argv[1]
@@ -39,42 +42,57 @@ def main():
 
     update_paths = args[0::2]
     sizes = list(map(int, args[1::2]))
-    print("Aggregator received updates:", update_paths)
-    print("Sizes:", sizes)
 
-    # Load base (global) model to get architecture
-    base_model = load_model(global_model_path)
+    print("\n[Aggregator] Update files:", update_paths)
+    print("[Aggregator] Sizes:", sizes)
+
+    # Load global model (.h5)
+    base_model = keras.models.load_model(global_model_path)
     base_weights = base_model.get_weights()
 
-    # Load all update weights into numpy arrays
+    # Load all JSON update weights
     weight_sets = []
     for p in update_paths:
         if not os.path.exists(p):
-            print(f"Update file missing: {p}")
+            print(f"[ERROR] Update file missing: {p}")
             sys.exit(3)
-        ws = load_model(p).get_weights()
-        weight_sets.append([np.array(w) for w in ws])
 
-    # Some safeguards: ensure shapes match
+        update_model = keras.models.load_model(p)
+        ws = update_model.get_weights()
+        weight_sets.append(ws)
+
+       
+
+    # Validate shape compatibility
     for i, ws in enumerate(weight_sets):
         if len(ws) != len(base_weights):
-            print(f"Shape mismatch: update {update_paths[i]} has {len(ws)} weight arrays, base has {len(base_weights)}")
+            print(f"[ERROR] Layer count mismatch in {update_paths[i]}")
             sys.exit(4)
+
         for a, b in zip(ws, base_weights):
             if a.shape != b.shape:
-                print(f"Layer shape mismatch between {update_paths[i]} and base: {a.shape} vs {b.shape}")
+                print(f"[ERROR] Shape mismatch in {update_paths[i]}: {a.shape} vs global {b.shape}")
                 sys.exit(5)
 
-    # Weighted average
-    averaged = weighted_average(weight_sets, sizes)
+    # Perform weighted average aggregation
+    averaged_weights = weighted_average(weight_sets, sizes)
+    # Apply averaged weights
+    base_model.set_weights(averaged_weights)
 
-    # Assign averaged weights to base model and save
-    base_model.set_weights(averaged)
-    # Ensure output directory exists
-    out_dir = os.path.dirname(out_path)
-    os.makedirs(out_dir, exist_ok=True)
+    # Compile the model to remove warnings
+    base_model.compile(
+    optimizer='adam',            # or the optimizer you want
+    loss='binary_crossentropy',  # or your model's loss
+    metrics=['accuracy']         # or metrics you care about
+    )
+
+
+    # Save updated global model
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
     base_model.save(out_path, include_optimizer=False)
-    print("Aggregated model written to:", out_path)
+
+    print("\n[Aggregator] Aggregation complete!")
+    print("[Aggregator] Saved updated model to:", out_path)
 
 if __name__ == "__main__":
     main()
