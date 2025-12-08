@@ -68,7 +68,7 @@ async function aggregateRound() {
     let sizes = [];
 
     // ---------------------------------------------------------
-    // FETCH updates & skip missing files (IMPORTANT FIX)
+    // FETCH updates & FILTER OUT JSON FILES (MAIN FIX)
     // ---------------------------------------------------------
     for (let i = 0; i < Number(count); i++) {
         const u = await contract.methods.getUpdate(String(ROUND), i).call();
@@ -79,9 +79,16 @@ async function aggregateRound() {
 
         if (!fs.existsSync(localPath)) {
             console.log(`⚠️ Skipping missing update: ${localPath}`);
-            continue;  // ← FIX: Skip instead of stopping
+            continue;
         }
 
+        // ❌ FIX: SKIP JSON WEIGHT FILES  
+        if (localPath.endsWith(".json")) {
+            console.log(`⚠️ Skipping JSON weight file (not valid for FL): ${localPath}`);
+            continue;
+        }
+
+        // Only accept .h5 model updates
         updatePaths.push(localPath);
         sizes.push(size);
     }

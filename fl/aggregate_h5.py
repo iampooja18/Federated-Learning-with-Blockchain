@@ -1,21 +1,23 @@
-# fl/aggregate_h5.py
-# Usage:
-# python3 aggregate_h5.py <out_path> <global_model_path> <update1_json> <size1> <update2_json> <size2> ...
-
 import sys
 import os
 import json
 import numpy as np
 import tensorflow as tf
-import keras
+from tensorflow import keras
 
 
+# ------------------------------
+# Load JSON raw weight list
+# ------------------------------
 def load_json_weights(path):
-    with open(path, "r", encoding="utf-8") as f:  # <-- add encoding="utf-8" here
+    with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
-    return data
+    return [np.array(w) for w in data]
 
 
+# ------------------------------
+# Weighted Average
+# ------------------------------
 def weighted_average(weight_sets, sizes):
     total = sum(sizes)
     factors = [s / total for s in sizes]
@@ -31,9 +33,13 @@ def weighted_average(weight_sets, sizes):
 
     return averaged
 
+
+# ------------------------------
+# MAIN
+# ------------------------------
 def main():
     if len(sys.argv) < 5 or (len(sys.argv) - 3) % 2 != 0:
-        print("Usage: python3 aggregate_h5.py <out_path> <global_model_path> <update1_json> <size1> ...")
+        print("Usage: python3 aggregate_h5.py <out_path> <global_model_path> <update1> <size1> ...")
         sys.exit(2)
 
     out_path = sys.argv[1]
@@ -46,24 +52,41 @@ def main():
     print("\n[Aggregator] Update files:", update_paths)
     print("[Aggregator] Sizes:", sizes)
 
-    # Load global model (.h5)
+    # Load global model
     base_model = keras.models.load_model(global_model_path)
     base_weights = base_model.get_weights()
 
-    # Load all JSON update weights
     weight_sets = []
+
+    # ------------------------------
+    # Process each update file
+    # ------------------------------
     for p in update_paths:
         if not os.path.exists(p):
             print(f"[ERROR] Update file missing: {p}")
             sys.exit(3)
 
-        update_model = keras.models.load_model(p)
-        ws = update_model.get_weights()
-        weight_sets.append(ws)
+        # .json → raw weight list
+        if p.endswith(".json"):
+            print(f"[Aggregator] Loading JSON weight file: {p}")
+            ws = load_json_weights(p)
+            weight_sets.append(ws)
+            continue
 
-       
+        # .h5 or .keras → full Keras model
+        if p.endswith(".h5") or p.endswith(".keras"):
+            print(f"[Aggregator] Loading H5/Keras model file: {p}")
+            update_model = keras.models.load_model(p)
+            ws = update_model.get_weights()
+            weight_sets.append(ws)
+            continue
 
-    # Validate shape compatibility
+        print(f"[WARNING] Unsupported file type ignored: {p}")
+        continue
+
+    # ------------------------------
+    # Validate compatibility
+    # ------------------------------
     for i, ws in enumerate(weight_sets):
         if len(ws) != len(base_weights):
             print(f"[ERROR] Layer count mismatch in {update_paths[i]}")
@@ -74,25 +97,26 @@ def main():
                 print(f"[ERROR] Shape mismatch in {update_paths[i]}: {a.shape} vs global {b.shape}")
                 sys.exit(5)
 
-    # Perform weighted average aggregation
+    # ------------------------------
+    # Aggregation
+    # ------------------------------
     averaged_weights = weighted_average(weight_sets, sizes)
-    # Apply averaged weights
     base_model.set_weights(averaged_weights)
 
-    # Compile the model to remove warnings
+    # Compile to silence Keras warnings
     base_model.compile(
-    optimizer='adam',            # or the optimizer you want
-    loss='binary_crossentropy',  # or your model's loss
-    metrics=['accuracy']         # or metrics you care about
+        optimizer="adam",
+        loss="binary_crossentropy",
+        metrics=["accuracy"]
     )
 
-
-    # Save updated global model
+    # Save final aggregated model
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     base_model.save(out_path, include_optimizer=False)
 
     print("\n[Aggregator] Aggregation complete!")
     print("[Aggregator] Saved updated model to:", out_path)
+
 
 if __name__ == "__main__":
     main()
