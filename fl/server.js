@@ -64,16 +64,20 @@ app.post("/predict", upload.single("image"), async (req, res) => {
 });
 
 // ================================================================
-//   🔥 SUBMIT UPDATE TO BLOCKCHAIN
+//   🔥 SUBMIT UPDATE TO BLOCKCHAIN  (FINAL FIXED VERSION)
 // ================================================================
 app.post("/submit-update", async (req, res) => {
   try {
     const { weightsPath, weightsHash, weightsSize, round } = req.body;
 
-    if (!weightsPath || !weightsHash)
-      return res.status(400).json({ success: false, message: "Invalid update metadata" });
+    if (!weightsPath || !weightsHash) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid update metadata"
+      });
+    }
 
-    // 1️⃣ Fetch current round from blockchain
+    // 1️⃣ CURRENT ROUND FROM BLOCKCHAIN
     const currentRound = await contract.methods.currentRound().call();
     const usingRound = round ?? currentRound;
 
@@ -85,12 +89,11 @@ app.post("/submit-update", async (req, res) => {
 
     const from = wallet[0].address;
 
-    // Convert to BigInt for Web3 v4
     const roundBig = BigInt(usingRound);
     const sizeBig = BigInt(weightsSize);
 
     // ================================================================
-    //   ✔ OPTION 1 FIX → CHECK IF ROUND IS STILL COLLECTING
+    //  ✔ ROUND STATE CHECK
     // ================================================================
     const roundInfo = await contract.methods.rounds(roundBig).call();
 
@@ -98,12 +101,13 @@ app.post("/submit-update", async (req, res) => {
       console.log("⚠ Update rejected: Round already closed:", usingRound);
       return res.status(400).json({
         success: false,
+        round: usingRound,   // ← ADDED
         message: "Round is already closed — update ignored"
       });
     }
 
     // ================================================================
-    // 2️⃣ Estimate gas
+    // 2️⃣ ESTIMATE GAS
     // ================================================================
     let gas;
     try {
@@ -118,7 +122,7 @@ app.post("/submit-update", async (req, res) => {
     }
 
     // ================================================================
-    // 3️⃣ Submit to blockchain
+    // 3️⃣ SUBMIT UPDATE ON-CHAIN
     // ================================================================
     const tx = await contract.methods
       .submitUpdate(roundBig, weightsPath, weightsHash, sizeBig)
@@ -126,16 +130,26 @@ app.post("/submit-update", async (req, res) => {
 
     console.log("✅ Update submitted on-chain:", tx.transactionHash);
 
-    res.json({
+    // ================================================================
+    // 👉 CRITICAL FIX: RETURN round so python_client.py does NOT CRASH
+    // ================================================================
+    return res.json({
       success: true,
-      txHash: tx.transactionHash
+      txHash: tx.transactionHash,
+      round: usingRound      // ← **MOST IMPORTANT FIX**
     });
 
   } catch (err) {
     console.error("❌ Error submitting update:", err);
-    res.status(500).json({ success: false, error: err.toString() });
+
+    return res.status(500).json({
+      success: false,
+      round: null,
+      error: err.toString()
+    });
   }
 });
+
 
 // ================================================================
 //   START SERVER
