@@ -1,7 +1,8 @@
 import React, { useState } from "react";
 import toast from "react-hot-toast";
 
-const API = import.meta.env.VITE_API_URL || "http://127.0.0.1:5000";
+const PREDICT_API = import.meta.env.VITE_PREDICT_API; // http://localhost:6000
+const FL_API = import.meta.env.VITE_FL_API;           // http://localhost:5000
 
 export default function UploadPredict() {
   const [file, setFile] = useState(null);
@@ -14,51 +15,68 @@ export default function UploadPredict() {
     const f = e.target.files[0];
     setFile(f || null);
     setResult(null);
-
-    if (f) {
-      setPreview(URL.createObjectURL(f));
-    }
+    if (f) setPreview(URL.createObjectURL(f));
   };
 
+  // 🔥 FIXED: SEND RAW BYTES (NOT FormData)
   const handlePredict = async () => {
     if (!file) return toast.error("Select an image first");
 
-    const fd = new FormData();
-    fd.append("image", file);
+    setResult(null);        // ✅ ADD THIS LINE
+    setPredicting(true); // ✅ ALWAYS CLEAR OLD RESULT FIRST
 
-    setPredicting(true);
     try {
-      const res = await fetch(`${API}/predict`, {
+      const arrayBuffer = await file.arrayBuffer();
+
+      const res = await fetch(`${PREDICT_API}/predict`, {
         method: "POST",
-        body: fd
+        headers: {
+          "Content-Type": "application/octet-stream"
+        },
+        body: arrayBuffer
       });
 
       const data = await res.json();
-      if (!data.success) throw new Error(data.message);
+
+      // ✅ HANDLE HUMAN / ERROR RESPONSE
+      if (!res.ok || data.success === false) {
+        throw new Error(data.error || data.message || "Prediction failed");
+
+      }
 
       setResult(data);
+      toast.success("Prediction & local training done!");
     } catch (err) {
+      setResult(null); // ✅ ENSURE RESULT IS CLEARED
       toast.error(err.message);
     } finally {
       setPredicting(false);
     }
   };
 
+
+
   const handleSubmitUpdate = async () => {
     if (!result?.weightsPath) return toast.error("No update generated");
 
     setSending(true);
     try {
-      const res = await fetch(`${API}/submit-update`, {
+      const res = await fetch(`${FL_API}/submit-update`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(result)
+        body: JSON.stringify({
+          clientId: "frontend_client",
+          weightsPath: result.weightsPath,
+          weightsHash: result.weightsHash,
+          weightsSize: result.weightsSize,
+          round: 1
+        })
       });
 
       const data = await res.json();
       if (!data.success) throw new Error(data.message);
 
-      toast.success("Update submitted");
+      toast.success(`Update submitted (Round ${data.round})`);
     } catch (err) {
       toast.error(err.message);
     } finally {
@@ -67,23 +85,20 @@ export default function UploadPredict() {
   };
 
   return (
-    <div >
+    <div style={styles.container}>
       <h2 style={styles.heading}>🐶 Cat vs Dog Classifier</h2>
 
-      {/* IMAGE PREVIEW */}
       {preview && (
         <div style={styles.previewContainer}>
           <img src={preview} alt="Uploaded" style={styles.previewImg} />
         </div>
       )}
 
-      {/* FILE PICKER */}
       <label style={styles.uploadBtn}>
         <input type="file" accept="image/*" onChange={onFile} style={{ display: "none" }} />
         📤 Choose Image
       </label>
 
-      {/* PREDICT BUTTON */}
       <button
         disabled={!file || predicting}
         onClick={handlePredict}
@@ -95,7 +110,6 @@ export default function UploadPredict() {
         {predicting ? "⏳ Working…" : "🔍 Predict & Train"}
       </button>
 
-      {/* SEND UPDATE BUTTON */}
       <button
         disabled={!result?.weightsPath || sending}
         onClick={handleSubmitUpdate}
@@ -107,20 +121,20 @@ export default function UploadPredict() {
         {sending ? "⏳ Submitting..." : "🚀 Send to Global FL"}
       </button>
 
-      {/* RESULT CARD */}
-      {result && (
+      {result?.success && (
         <div style={styles.card}>
           <h3 style={styles.cardTitle}>📊 Prediction Result</h3>
           <p><strong>Label:</strong> {result.label}</p>
           <p><strong>Confidence:</strong> {(result.score * 100).toFixed(2)}%</p>
-          <p><strong>Weights File:</strong> {result.weightsPath}</p>
+          <p style={styles.pathText}>
+            <strong>Weights File:</strong> {result.weightsPath}
+          </p>
         </div>
       )}
+
     </div>
   );
 }
-
-// css
 
 const styles = {
   container: {
@@ -143,9 +157,7 @@ const styles = {
   },
   previewImg: {
     width: "50%",
-    height: "auto",
-    borderRadius: "12px",
-    boxShadow: "0 4px 12px rgba(0,0,0,0.1)"
+    borderRadius: "12px"
   },
   uploadBtn: {
     display: "inline-block",
@@ -154,8 +166,7 @@ const styles = {
     color: "#fff",
     borderRadius: "10px",
     cursor: "pointer",
-    marginBottom: "15px",
-    fontWeight: "600"
+    marginBottom: "15px"
   },
   actionBtn: {
     width: "100%",
@@ -165,8 +176,7 @@ const styles = {
     border: "none",
     borderRadius: "10px",
     fontSize: "16px",
-    cursor: "pointer",
-    transition: "0.2s"
+    cursor: "pointer"
   },
   card: {
     marginTop: "20px",
@@ -179,5 +189,10 @@ const styles = {
     fontSize: "18px",
     fontWeight: "600",
     marginBottom: "10px"
+  },
+  pathText: {
+    wordBreak: "break-all",
+    overflowWrap: "anywhere",
+    whiteSpace: "normal"
   }
 };

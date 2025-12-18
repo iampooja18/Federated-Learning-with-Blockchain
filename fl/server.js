@@ -6,54 +6,82 @@ const cors = require("cors");
 const bodyParser = require("body-parser");
 const axios = require("axios");
 const multer = require("multer");
+const crypto = require("crypto");
 const { Web3 } = require("web3");
 
+// ================================================================
+// APP SETUP
+// ================================================================
 const app = express();
 app.use(cors({ origin: "*" }));
 app.use(bodyParser.json({ limit: "50mb" }));
 
-// Load config
-const { RPC_URL, CONTRACT_ADDRESS, ABI, CLIENT_PRIVATE_KEY, OWNER_PRIVATE_KEY } = require("./config");
+// ================================================================
+// LOAD CONFIG (BLOCKCHAIN = SOURCE OF TRUTH)
+// ================================================================
+const {
+  RPC_URL,
+  CONTRACT_ADDRESS,
+  ABI,
+  OWNER_PRIVATE_KEY
+} = require("./config");
 
-// Setup web3
+// ================================================================
+// WEB3 SETUP (SINGLE BLOCKCHAIN INTERFACE — KEEP IT SIMPLE)
+// ================================================================
 const web3 = new Web3(RPC_URL);
-
-// Load private keys
-try {
-  if (CLIENT_PRIVATE_KEY) web3.eth.accounts.wallet.add(CLIENT_PRIVATE_KEY);
-  if (OWNER_PRIVATE_KEY) web3.eth.accounts.wallet.add(OWNER_PRIVATE_KEY);
-} catch (e) {}
+web3.eth.accounts.wallet.add(OWNER_PRIVATE_KEY);
 
 const wallet = web3.eth.accounts.wallet;
 const contract = new web3.eth.Contract(ABI, CONTRACT_ADDRESS);
 
 // ================================================================
-//   🔥 GET CURRENT ROUND
+// IN-MEMORY UPDATE TRACKING
+// { round: [ { clientId, hash, path, size } ] }
+// ================================================================
+const updatesByRound = {};
+
+// ================================================================
+// GET CURRENT ROUND (BLOCKCHAIN = SOURCE OF TRUTH)
 // ================================================================
 app.get("/current-round", async (req, res) => {
   try {
-    const round = await contract.methods.currentRound().call();
-    res.json({ round: Number(round) });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.toString() });
+    const round = Number(await contract.methods.currentRound().call());
+    const info = await contract.methods.rounds(round).call();
+
+    res.json({
+      round,
+      global_model_hash: info.globalModelHash
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.toString() });
   }
 });
 
+
 // ================================================================
-//   🔥 PREDICT (Image → Python Server)
+// IMAGE PREDICTION (INFERENCE FLOW — NOT PART OF FL)
 // ================================================================
-const upload = multer({ dest: path.join(__dirname, "../storage/uploads/") });
+const upload = multer({
+  dest: path.join(__dirname, "../storage/uploads/")
+});
 
 app.post("/predict", upload.single("image"), async (req, res) => {
   try {
-    if (!req.file)
-      return res.status(400).json({ success: false, message: "Image required" });
+    if (!req.file) {
+      return res.status(400).json({
+        success: false,
+        message: "Image required"
+      });
+    }
 
     const imgBytes = fs.readFileSync(req.file.path);
 
-    const pyRes = await axios.post("http://127.0.0.1:6000/predict", imgBytes, {
-      headers: { "Content-Type": "application/octet-stream" }
-    });
+    const pyRes = await axios.post(
+      "http://127.0.0.1:7000/predict",
+      imgBytes,
+      { headers: { "Content-Type": "application/octet-stream" } }
+    );
 
     res.json(pyRes.data);
 
@@ -64,96 +92,127 @@ app.post("/predict", upload.single("image"), async (req, res) => {
 });
 
 // ================================================================
-//   🔥 SUBMIT UPDATE TO BLOCKCHAIN  (FINAL FIXED VERSION)
+// SUBMIT MODEL UPDATE (FEDERATED LEARNING — PAPER CORE)
 // ================================================================
 app.post("/submit-update", async (req, res) => {
   try {
-    const { weightsPath, weightsHash, weightsSize, round } = req.body;
+    const {
+      clientId,
+      weightsPath,
+      weightsHash,
+      weightsSize,
+      round
+    } = req.body;
 
-    if (!weightsPath || !weightsHash) {
+    if (!clientId || !weightsPath || !weightsHash) {
       return res.status(400).json({
         success: false,
-        message: "Invalid update metadata"
+        message: "Missing update metadata"
       });
     }
 
-    // 1️⃣ CURRENT ROUND FROM BLOCKCHAIN
-    const currentRound = await contract.methods.currentRound().call();
-    const usingRound = round ?? currentRound;
+    // ================================================================
+    // 1️⃣ ROUND RESOLUTION (BLOCKCHAIN DECIDES)
+// ================================================================
+    const chainRound = await contract.methods.currentRound().call();
+    const usingRound = Number(round ?? chainRound);
 
-    console.log("\n📥 New FL Update Received");
-    console.log("  Path:", weightsPath);
-    console.log("  Hash:", weightsHash);
-    console.log("  Size:", weightsSize);
-    console.log("  Round:", usingRound);
-
-    const from = wallet[0].address;
-
-    const roundBig = BigInt(usingRound);
-    const sizeBig = BigInt(weightsSize);
+    console.log("\n📥 FL UPDATE RECEIVED");
+    console.log(" Client:", clientId);
+    console.log(" Round :", usingRound);
+    console.log(" Hash  :", weightsHash);
 
     // ================================================================
-    //  ✔ ROUND STATE CHECK
-    // ================================================================
-    const roundInfo = await contract.methods.rounds(roundBig).call();
+    // 2️⃣ CHECK ROUND STATE ON-CHAIN
+// ================================================================
+    const roundInfo = await contract.methods.rounds(usingRound).call();
 
     if (!roundInfo.collecting) {
-      console.log("⚠ Update rejected: Round already closed:", usingRound);
       return res.status(400).json({
         success: false,
-        round: usingRound,   // ← ADDED
-        message: "Round is already closed — update ignored"
+        round: usingRound,
+        message: "Round closed — update rejected"
       });
     }
 
     // ================================================================
-    // 2️⃣ ESTIMATE GAS
+    // 3️⃣ OFF-CHAIN UPDATE TRACKING (MULTI-CLIENT SAFE)
+// ================================================================
+    if (!updatesByRound[usingRound]) {
+      updatesByRound[usingRound] = [];
+    }
+
+    const duplicate = updatesByRound[usingRound]
+      .some(u => u.clientId === clientId);
+
+    if (duplicate) {
+      return res.status(400).json({
+        success: false,
+        message: "Client already submitted for this round"
+      });
+    }
+
+    updatesByRound[usingRound].push({
+      clientId,
+      hash: weightsHash,
+      path: weightsPath,
+      size: weightsSize
+    });
+
     // ================================================================
+    // 4️⃣ BLOCKCHAIN VERIFICATION (HASH ONLY — PAPER COMPLIANT)
+// ================================================================
+    const from = wallet[0].address;
+
     let gas;
     try {
       gas = await contract.methods
-        .submitUpdate(roundBig, weightsPath, weightsHash, sizeBig)
+        .submitUpdate(
+          usingRound,
+          weightsPath,
+          weightsHash,
+          weightsSize
+        )
         .estimateGas({ from });
 
       gas = Math.floor(gas * 1.25);
-    } catch (err) {
-      console.warn("⚠ Gas estimation error:", err.toString());
+    } catch {
       gas = 500_000;
     }
 
-    // ================================================================
-    // 3️⃣ SUBMIT UPDATE ON-CHAIN
-    // ================================================================
     const tx = await contract.methods
-      .submitUpdate(roundBig, weightsPath, weightsHash, sizeBig)
+      .submitUpdate(
+        usingRound,
+        weightsPath,
+        weightsHash,
+        weightsSize
+      )
       .send({ from, gas });
 
-    console.log("✅ Update submitted on-chain:", tx.transactionHash);
+    console.log("✅ Blockchain update recorded:", tx.transactionHash);
 
     // ================================================================
-    // 👉 CRITICAL FIX: RETURN round so python_client.py does NOT CRASH
-    // ================================================================
+    // 5️⃣ RESPONSE (CLIENT NEEDS ROUND NUMBER)
+// ================================================================
     return res.json({
       success: true,
+      round: usingRound,
       txHash: tx.transactionHash,
-      round: usingRound      // ← **MOST IMPORTANT FIX**
+      totalUpdatesThisRound: updatesByRound[usingRound].length
     });
 
   } catch (err) {
-    console.error("❌ Error submitting update:", err);
-
+    console.error("❌ Submit update error:", err);
     return res.status(500).json({
       success: false,
-      round: null,
       error: err.toString()
     });
   }
 });
 
-
 // ================================================================
-//   START SERVER
+// START SERVER
 // ================================================================
-app.listen(5000, () =>
-  console.log("🚀 Node API running at http://127.0.0.1:5000")
-);
+app.listen(5000, () => {
+  console.log("🚀 Node API running at http://127.0.0.1:5000");
+});

@@ -6,25 +6,39 @@ import tensorflow as tf
 from tensorflow import keras
 
 
-# ------------------------------
+# =====================================================
 # Load JSON raw weight list
-# ------------------------------
+# =====================================================
 def load_json_weights(path):
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
-    return [np.array(w) for w in data]
+
+    # Ensure list of numpy arrays
+    return [np.array(w, dtype=np.float32) for w in data]
 
 
-# ------------------------------
-# Weighted Average
-# ------------------------------
+# =====================================================
+# Federated Weighted Average (FedAvg)
+# =====================================================
 def weighted_average(weight_sets, sizes):
-    total = sum(sizes)
+    if len(weight_sets) == 0:
+        raise ValueError("No weight sets provided for aggregation")
+
+    # Default equal weighting if sizes missing or invalid
+    if not sizes or len(sizes) != len(weight_sets):
+        sizes = [1 for _ in weight_sets]
+
+    total = float(sum(sizes))
     factors = [s / total for s in sizes]
 
     averaged = []
-    for layer_idx in range(len(weight_sets[0])):
-        layer_sum = np.zeros_like(weight_sets[0][layer_idx], dtype=np.float64)
+    num_layers = len(weight_sets[0])
+
+    for layer_idx in range(num_layers):
+        layer_sum = np.zeros_like(
+            weight_sets[0][layer_idx],
+            dtype=np.float64
+        )
 
         for w, f in zip(weight_sets, factors):
             layer_sum += w[layer_idx].astype(np.float64) * f
@@ -34,88 +48,108 @@ def weighted_average(weight_sets, sizes):
     return averaged
 
 
-# ------------------------------
+# =====================================================
 # MAIN
-# ------------------------------
+# =====================================================
 def main():
-    if len(sys.argv) < 5 or (len(sys.argv) - 3) % 2 != 0:
-        print("Usage: python3 aggregate_h5.py <out_path> <global_model_path> <update1> <size1> ...")
+    """
+    Usage:
+    python aggregate_h5.py <out_model_path> <base_global_model>
+        <update1> <size1> <update2> <size2> ...
+    """
+
+    if len(sys.argv) < 4:
+        print("Usage:")
+        print("  python aggregate_h5.py <out_model> <base_model> <update1> <size1> ...")
         sys.exit(2)
 
     out_path = sys.argv[1]
-    global_model_path = sys.argv[2]
+    base_model_path = sys.argv[2]
     args = sys.argv[3:]
+
+    if len(args) % 2 != 0:
+        print("[ERROR] Updates and sizes must be paired")
+        sys.exit(3)
 
     update_paths = args[0::2]
     sizes = list(map(int, args[1::2]))
 
-    print("\n[Aggregator] Update files:", update_paths)
-    print("[Aggregator] Sizes:", sizes)
+    print("\n[Aggregator] Base global model:", base_model_path)
+    print("[Aggregator] Update files:", update_paths)
+    print("[Aggregator] Sample sizes:", sizes)
 
-    # Load global model
-    base_model = keras.models.load_model(global_model_path)
+    # =====================================================
+    # Load base global model
+    # =====================================================
+    if not os.path.exists(base_model_path):
+        print("[ERROR] Base global model not found:", base_model_path)
+        sys.exit(4)
+
+    base_model = keras.models.load_model(base_model_path)
     base_weights = base_model.get_weights()
 
     weight_sets = []
 
-    # ------------------------------
-    # Process each update file
-    # ------------------------------
+    # =====================================================
+    # Load client updates
+    # =====================================================
     for p in update_paths:
         if not os.path.exists(p):
             print(f"[ERROR] Update file missing: {p}")
-            sys.exit(3)
+            sys.exit(5)
 
-        # .json → raw weight list
         if p.endswith(".json"):
-            print(f"[Aggregator] Loading JSON weight file: {p}")
+            print(f"[Aggregator] Loading JSON weights: {p}")
             ws = load_json_weights(p)
-            weight_sets.append(ws)
-            continue
-
-        # .h5 or .keras → full Keras model
-        if p.endswith(".h5") or p.endswith(".keras"):
-            print(f"[Aggregator] Loading H5/Keras model file: {p}")
+        elif p.endswith(".h5") or p.endswith(".keras"):
+            print(f"[Aggregator] Loading Keras model: {p}")
             update_model = keras.models.load_model(p)
             ws = update_model.get_weights()
-            weight_sets.append(ws)
-            continue
+        else:
+            print(f"[ERROR] Unsupported update format: {p}")
+            sys.exit(6)
 
-        print(f"[WARNING] Unsupported file type ignored: {p}")
-        continue
+        weight_sets.append(ws)
 
-    # ------------------------------
+    # =====================================================
     # Validate compatibility
-    # ------------------------------
-    for i, ws in enumerate(weight_sets):
+    # =====================================================
+    for idx, ws in enumerate(weight_sets):
         if len(ws) != len(base_weights):
-            print(f"[ERROR] Layer count mismatch in {update_paths[i]}")
-            sys.exit(4)
+            print(f"[ERROR] Layer count mismatch in update: {update_paths[idx]}")
+            sys.exit(7)
 
-        for a, b in zip(ws, base_weights):
+        for l_idx, (a, b) in enumerate(zip(ws, base_weights)):
             if a.shape != b.shape:
-                print(f"[ERROR] Shape mismatch in {update_paths[i]}: {a.shape} vs global {b.shape}")
-                sys.exit(5)
+                print(
+                    f"[ERROR] Shape mismatch in {update_paths[idx]} "
+                    f"layer {l_idx}: {a.shape} vs {b.shape}"
+                )
+                sys.exit(8)
 
-    # ------------------------------
-    # Aggregation
-    # ------------------------------
+    # =====================================================
+    # FedAvg aggregation
+    # =====================================================
     averaged_weights = weighted_average(weight_sets, sizes)
     base_model.set_weights(averaged_weights)
 
-    # Compile to silence Keras warnings
+    # =====================================================
+    # Compile (required for save, metrics irrelevant)
+    # =====================================================
     base_model.compile(
         optimizer="adam",
         loss="binary_crossentropy",
         metrics=["accuracy"]
     )
 
-    # Save final aggregated model
+    # =====================================================
+    # Save aggregated global model (OFF-CHAIN)
+    # =====================================================
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     base_model.save(out_path, include_optimizer=False)
 
-    print("\n[Aggregator] Aggregation complete!")
-    print("[Aggregator] Saved updated model to:", out_path)
+    print("\n[Aggregator] ✅ Aggregation complete")
+    print("[Aggregator] Global model saved to:", out_path)
 
 
 if __name__ == "__main__":

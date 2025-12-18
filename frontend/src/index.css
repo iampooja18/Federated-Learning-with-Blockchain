@@ -261,7 +261,7 @@
   scroll-behavior: smooth;
 }
 
- style scroll bar for WebKit browsers (Chrome, Edge, Safari) */
+/*style scroll bar for WebKit browsers (Chrome, Edge, Safari) */
 .ql-snow .ql-picker.ql-font .ql-picker-options::-webkit-scrollbar {
   width: 6px;
 }
